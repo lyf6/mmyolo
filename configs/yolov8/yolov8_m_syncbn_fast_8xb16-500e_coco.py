@@ -7,7 +7,7 @@ last_stage_out_channels = 768
 
 affine_scale = 0.9
 mixup_prob = 0.1
-
+# train_batch_size_per_gpu = 2
 # =======================Unmodified in most cases==================
 img_scale = _base_.img_scale
 pre_transform = _base_.pre_transform

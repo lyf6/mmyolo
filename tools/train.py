@@ -90,7 +90,7 @@ def main():
     # resume is determined in this priority: resume from > auto_resume
     if args.resume == 'auto':
         cfg.resume = True
-        cfg.load_from = None
+        cfg.load_from = None.ji
     elif args.resume is not None:
         cfg.resume = True
         cfg.load_from = args.resume

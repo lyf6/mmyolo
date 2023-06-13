@@ -61,9 +61,10 @@ def shift_predictions(det_data_samples: SampleList,
 
         # shift bboxes and masks
         pred_inst.bboxes = shifted_bboxes
-        if 'masks' in det_data_sample:
+        if 'masks' in det_data_sample.pred_instances:
             pred_inst.masks = shift_masks(pred_inst.masks, offset,
                                           src_image_shape)
+            
 
         shifted_predictions.append(pred_inst.clone())
 

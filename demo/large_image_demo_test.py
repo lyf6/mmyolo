@@ -15,25 +15,28 @@ import os
 import random
 from argparse import ArgumentParser
 from pathlib import Path
-
+import mmengine
 import mmcv
 import numpy as np
 from mmdet.apis import inference_detector, init_detector
 from mmengine.config import Config, ConfigDict
 from mmengine.logging import print_log
 from mmengine.utils import ProgressBar
-
+import cv2
+import torch
+from mmengine.structures import InstanceData
 try:
     from sahi.slicing import slice_image
 except ImportError:
     raise ImportError('Please run "pip install -U sahi" '
                       'to install sahi first for large image inference.')
-
+import matplotlib.pyplot as plt
 from mmyolo.registry import VISUALIZERS
 from mmyolo.utils import switch_to_deploy
 from mmyolo.utils.large_image import merge_results_by_nms, shift_predictions
 from mmyolo.utils.misc import get_file_list
-# dim
+from segment_anything import sam_model_registry, SamPredictor
+from pycocotools.mask import encode
 
 def parse_args():
     parser = ArgumentParser(
@@ -57,18 +60,18 @@ def parse_args():
         action='store_true',
         help='Whether to use test time augmentation')
     parser.add_argument(
-        '--score-thr', type=float, default=0.45, help='Bbox score threshold')
+        '--score-thr', type=float, default=0.5, help='Bbox score threshold')
     parser.add_argument(
-        '--patch-size', type=int, default=640, help='The size of patches')
+        '--patch-size', type=int, default=2048, help='The size of patches')
     parser.add_argument(
         '--patch-overlap-ratio',
         type=float,
-        default=0.45,
+        default=0.4,
         help='Ratio of overlap between two patches')
     parser.add_argument(
         '--merge-iou-thr',
         type=float,
-        default=0.1,
+        default=0.2,
         help='IoU threshould for merging results')
     parser.add_argument(
         '--merge-nms-type',
@@ -89,8 +92,61 @@ def parse_args():
         action='store_true',
         help='Save the results of each patch. '
         'The `--debug` must be enabled.')
+    parser.add_argument(
+        '--max_batch_num_pred',
+        type=int,
+        default=1,
+        help='Batch size, must greater than or equal to 1')
+    
     args = parser.parse_args()
     return args
+
+
+def single_encode(x):
+    rle = encode(np.asarray(x[:, :, None], order='F', dtype='uint8'))[0]
+    rle['counts'] = rle['counts'].decode('utf-8')
+    return rle
+
+def json(img_name, result, img_id, width, height):
+    image = dict()
+    
+    image['file_name'] = img_name
+    image['width'] = width
+    image['height'] = height
+    image['id'] = img_id
+    
+    bboxes = result['bboxes'].cpu().numpy().astype(np.int)
+    bboxes[:, 2:4] = bboxes[:, 2:4] - bboxes[:, 0:2]
+    scores = result['scores'].cpu().numpy()
+    cls_id = result['labels'].cpu().numpy()
+    det_num = len(bboxes)
+    if(det_num==0):
+        return None, None
+    masks = result['masks']
+    if isinstance(masks, torch.Tensor):
+        masks = masks.cpu().numpy()
+
+
+    datas = []
+    for id in range(det_num):
+        data = dict()
+        # tmp = (segs[id].reshape(1, -1)*512).astype(np.int).clip(0, 512).tolist()
+        data['image_id'] = img_id
+
+        # x1, x2, y1, y2 = [bb[0], bb[0]+bb[2], bb[1], bb[1]+bb[3]]
+        data['area'] = int(bboxes[id][2]*bboxes[id][3])
+        data['bbox'] = bboxes[id].tolist()
+        data['score'] = scores[id]
+        data['category_id'] = cls_id[id] + 1
+        mask = masks[id]
+        data['segmentation'] = single_encode(mask)
+        data['id'] = int(id)
+        datas.append(data)
+        id += 1
+    return image, datas
+
+# def write_json()
+
 
 
 def main():
@@ -145,7 +201,20 @@ def main():
     print(f'Performing inference on {len(files)} images.... '
           'This may take a while.')
     progress_bar = ProgressBar(len(files))
-    for file in files:
+
+    # load sam model
+    sam_checkpoint = "/home/yf/Documents/segment-anything/weights/vit_h.pth"
+    model_type = "vit_h"
+
+    device = "cuda"
+
+    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+
+    predictor = SamPredictor(sam)
+    anns = []
+    ann_images = []
+    for img_id, file in enumerate(files):
         # read image
         img = mmcv.imread(file)
 
@@ -172,9 +241,53 @@ def main():
 
             # forward the model
             dets = inference_detector(model, images)
+            pred_inst = dets[0].pred_instances
+            # masks = torch.zeros((len(pred_inst),images[0].shape[0],images[0].shape[1]), device=device).bool()
+            index = pred_inst.scores >= args.score_thr
             
+            data_sample = InstanceData(metainfo={})
+           
+            # pred_inst.masks = masks
+            data_sample.bboxes = pred_inst.bboxes[index]
+            data_sample.scores = pred_inst.scores[index]
+            data_sample.labels = pred_inst.labels[index]
+            bboexes = pred_inst.bboxes.clone()[index]
+            # pred_inst = pred_inst[]
+            if(len(bboexes)>0):
+                num_pred = len(bboexes)
+                N = args.max_batch_num_pred
+                num_batches = int(np.ceil(num_pred / N))
+                sam_img = mmcv.imconvert(images[0], 'bgr', 'rgb')
+                
+                predictor.set_image(sam_img)
+                
+                masks = []
+                for i in range(num_batches):
+                    left_index = i * N
+                    right_index = (i + 1) * N
+                    if i == num_batches - 1:
+                        batch_boxes = bboexes[left_index:]
+                    else:
+                        batch_boxes = bboexes[left_index:right_index]
+                    torch.cuda.empty_cache()
+                    transformed_boxes = predictor.transform.apply_boxes_torch(batch_boxes, sam_img.shape[:2])
+                    
+                    batch_masks, _, _ = predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False,
+                    )
+                    batch_masks = batch_masks.squeeze(1)
+                    masks.extend([*batch_masks])
+                    # transformed_boxes = []
+                    
+                data_sample.masks = torch.stack(masks, dim=0)
+            # dets[0].mask = ""
+            dets[0].pred_instances = data_sample
             slice_results.extend(dets)
-
+            predictor.reset_image()
+            # torch.cuda.empty_cache()
             if end >= len(sliced_image_object):
                 break
             start += args.batch_size
@@ -185,6 +298,7 @@ def main():
             filename = os.path.basename(file)
 
         img = mmcv.imconvert(img, 'bgr', 'rgb')
+
         out_file = None if args.show else os.path.join(args.out_dir, filename)
 
         # export debug images
@@ -274,23 +388,54 @@ def main():
                 'type': args.merge_nms_type,
                 'iou_threshold': args.merge_iou_thr
             })
+        pred_dict =image_result.pred_instances
 
-        visualizer.add_datasample(
-            filename,
-            img,
-            data_sample=image_result,
-            draw_gt=False,
-            show=args.show,
-            wait_time=0,
-            out_file=out_file,
-            pred_score_thr=args.score_thr,
-        )
+        # width, height, _ = img.shape
+        ann_image, ann = json(filename, pred_dict, img_id, width, height)
+        if(ann_image is not None):
+            ann_images.append(ann_image)
+            anns.extend(ann)
+
         progress_bar.update()
 
     if not args.show or (args.debug and args.save_patch):
         print_log(
             f'\nResults have been saved at {os.path.abspath(args.out_dir)}')
+    
+    INFO = {
+    "description": "farmland",
+    "url": "",
+    "version": "0.1.0",
+    "year": 2023,
+    "contributor": "liuyanfei",
+    "date_created": "2023"
+    }
 
+    LICENSES = [
+        {
+            "id": 1,
+            "name": "",
+            "url": ""
+        }
+    ]
+    CATEGORIES = [
+        {
+            'id': 1,
+            'name': 'farmland',
+            'supercategory': 'farmland',
+        },
+    ]
+    results = {
+        "info": INFO,
+        "licenses": LICENSES,
+        "categories": CATEGORIES,
+        "images": [],
+        "annotations": []
+    }
+    results['annotations'] = anns
+    results['images'] = ann_images
+    out_json_path = "./result.json"
+    mmengine.dump(results, out_json_path)
 
 if __name__ == '__main__':
     main()
